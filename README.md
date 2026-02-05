@@ -1,1 +1,1 @@
-# CloudComputing
+# The web tier will receive face recognition requests from clients, store the images in an S3 input bucket, and return the classification results to the clients.
