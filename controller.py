@@ -49,13 +49,11 @@ def get_queue_details():
     # )["Attributes"]
     # resp_in_progress = int(resp_attrs["ApproximateNumberOfMessagesNotVisible"])
 
-    in_progress = req_in_progress
-    return pending, in_progress
+    return pending, req_in_progress
 
 def autoscale():
     print("Autoscale Started !!")
     while True:
-
         attributes = sqs.get_queue_attributes(
             QueueUrl = req_queue_url,
             AttributeNames = ["ApproximateNumberOfMessages"]
