@@ -1,12 +1,13 @@
 import boto3
 import time
+import logging
 
 request_queue = "1237312494-req-queue"
 
 ec2 = boto3.client("ec2")
 sqs = boto3.client("sqs")
 
-req_queue_url = sqs.get_queue_url(QueueName=request_queue)["QueueUrl"]
+request_queue_url = sqs.get_queue_url(QueueName=request_queue)["QueueUrl"]
 
 my_ami_id = "ami-06d2c2b98f0871537"
 instance_type = "t3.small"
@@ -25,65 +26,123 @@ def check_running_instances():
         ]
     )
     count = 0
-    for r in response["Reservations"]:
-        count += len(r["Instances"])
+    for i in response["Reservations"]:
+        count += len(i["Instances"])
     return count
 
+def get_all_instance_ids():
+    response = ec2.describe_instances (
+        Filters = [
+            {
+                "Name" : "tag:Name",
+                "Values": ["*"]
+            }
+        ]
+    )
+
+    instance_ids = [
+        inst["InstanceId"]
+        for res in response["Reservations"]
+        for inst in res["Instances"]
+    ]
+
+    logging.info(f"Instances Id : {instance_ids}")
+    return instance_ids
+
 def get_queue_details():
-    # Req queue: pending = visible messages waiting
-    req_attributes = sqs.get_queue_attributes (
-        QueueUrl = request_queue,
+    request = sqs.get_queue_attributes (
+        QueueUrl = request_queue_url,
         AttributeNames = [
             "ApproximateNumberOfMessages",
             "ApproximateNumberOfMessagesNotVisible"
         ]
     )["Attributes"]
-    pending = int(req_attributes["ApproximateNumberOfMessages"])
 
-    # In-progress: req NotVisible (being processed) + resp NotVisible (results pending delivery)
-    req_in_progress = int(req_attributes["ApproximateNumberOfMessagesNotVisible"])
+    pending_requests = int(request["ApproximateNumberOfMessages"])
+    in_progress_requests = int(request["ApproximateNumberOfMessagesNotVisible"])
 
-    # resp_attrs = sqs.get_queue_attributes(
-    #     QueueUrl=RESP_QUEUE_URL,
-    #     AttributeNames=["ApproximateNumberOfMessagesNotVisible"]
-    # )["Attributes"]
-    # resp_in_progress = int(resp_attrs["ApproximateNumberOfMessagesNotVisible"])
+    total_requests = pending_requests + in_progress_requests
+    logging.info(f"Total load : {total_requests}")
+    return total_requests
 
-    return pending, req_in_progress
+
+def start_instances(instance_ids, required):
+    if required == 0:
+        return
+
+    running = check_running_instances()
+    needed = required - running
+
+    if needed <= 0:
+        logging.info("All the app tier instances are running !!!")
+        return
+
+    stopped = get_stopped_instances(instance_ids)
+    start = stopped[:needed]
+
+    if start:
+        logging.info(f"Starting {len(start)} instances !!!")
+        ec2.start_instances(InstanceIds = start)
+    else:
+        logging.info("Instances not available !!!")
+
+def get_stopped_instances(instance_ids):
+    resp = ec2.describe_instances(InstanceIds = instance_ids)
+    stopped_instance_ids = [
+        i["InstanceId"]
+        for res in resp["Reservations"]
+        for i in res["Instances"]
+        if i["State"]["Name"] == "stopped"
+    ]
+    return stopped_instance_ids
+
+def stop_instances(instance_ids, required):
+    running = check_running_instances()
+
+    if running <= required:
+        return
+
+    extra = running - required
+
+    all_resp = ec2.describe_instances (
+        Filters = [
+            {
+                "Name": "tag:Name",
+                "Values": [f"app-tier-instance-*"]
+            }
+        ]
+    )
+
+    running_ids = [
+        i["InstanceId"]
+        for res in all_resp["Reservations"]
+        for i in res["Instances"]
+        if i["State"]["Name"] == "running"
+    ][:extra]
+
+    if running_ids:
+        logging.info(f"Stopping instances : {running_ids}")
+        ec2.stop_instances(InstanceIds = running_ids)
 
 def autoscale():
-    print("Autoscale Started !!")
+    logging.info("Autoscale Service started !!!")
+    instance_ids = get_all_instance_ids()
+
     while True:
-        attributes = sqs.get_queue_attributes(
-            QueueUrl = req_queue_url,
-            AttributeNames = ["ApproximateNumberOfMessages"]
-        )
+        running = check_running_instances()
+        workload = get_queue_details()
 
-        queue_size = int(attributes["Attributes"]["ApproximateNumberOfMessages"])
+        target_instances = min(workload, 15)
+        target_instances = max(0, target_instances)
 
-        running_instances = check_running_instances()
+        logging.info(f"Running: {running}, Workload: {workload}, Target: {target_instances}")
 
-        if queue_size == 0 and running_instances > 0:
-            # Stop all
-            print("Stopping all instances")
-            # implement stop logic
+        if running < target_instances:
+            start_instances(instance_ids, target_instances)
+        elif running > target_instances:
+            stop_instances(instance_ids, target_instances)
 
-        elif queue_size > running_instances and running_instances < max_instances_limit:
-            print("Scaling up")
-            ec2.run_instances(
-                ImageId=my_ami_id,
-                InstanceType=instance_type,
-                MinCount=1,
-                MaxCount=1,
-                TagSpecifications=[
-                    {
-                        "ResourceType": "instance",
-                        "Tags": [{"Key": "Name", "Value": f"app-tier-instance-{running_instances+1}"}]
-                    }
-                ]
-            )
-
-        time.sleep(5)
+        time.sleep(2)
 
 if __name__ == "__main__":
     autoscale()
