@@ -1,8 +1,6 @@
 import boto3
 import time
-import os
 import logging
-from botocore.exceptions import ClientError
 from model.face_recognition import face_match
 
 bucket_name = "1237312494-in-bucket"
@@ -15,99 +13,74 @@ sqs = boto3.client("sqs")
 dynamo_db = boto3.resource("dynamodb")
 dynamo_table = dynamo_db.Table(dynamo_db_table_name)
 
-req_queue_url = sqs.get_queue_url(QueueName=request_queue)["QueueUrl"]
-resp_queue_url = sqs.get_queue_url(QueueName=response_queue)["QueueUrl"]
+request_queue_url = sqs.get_queue_url(QueueName=request_queue)["QueueUrl"]
+response_queue_url = sqs.get_queue_url(QueueName=response_queue)["QueueUrl"]
 
-def fake_model_inference(image_bytes):
-    return "Paul"
+def get_model_prediction(image):
+    try:
+        result = face_match(image)
+        return result
+    except Exception as e:
+        print(f"Error : {e}")
+
+def get_dynamo_db_items(filename):
+    response = dynamo_table.get_item (
+        Key = {
+            "filename" : filename
+        }
+    )
+    return response
+
+def get_s3_object(filename):
+    value = s3.get_object (
+        Bucket = bucket_name,
+        Key = filename
+    )
+    image = value["Body"].read()
+    return image
 
 def app_service():
-    print("Application up and running !\n")
-    # hitCount = 0
-    # while True:
-    #     resp = sqsInstance.receive_message(
-    #         QueueUrl=sqsRequestQueueURL, MaxNumberOfMessages=1, WaitTimeSeconds=5
-    #     )
-    #     if "Messages" not in resp:
-    #         hitCount += 1
-    #         if hitCount >= 2:
-    #             if EC2_INSTANCE_ID:
-    #                 try:
-    #                     ec2Instance.stop_instances(InstanceIds=[EC2_INSTANCE_ID])
-    #                 except Exception:
-    #                     print("Error occured...")
-    #             break
-    #         continue
-    #     hitCount = 0
-    #     makePredictions(resp["Messages"][0])
+    logging.info("App Service up and running !!!\n")
     while True:
         try:
-            message_response = sqs.receive_message(
-                QueueUrl=req_queue_url,
-                MaxNumberOfMessages=1,
-                WaitTimeSeconds=20,
-                VisibilityTimeout=60
+            message_response = sqs.receive_message (
+                QueueUrl = request_queue_url,
+                MaxNumberOfMessages = 1,
+                WaitTimeSeconds = 20,
+                VisibilityTimeout = 60
             )
 
             if "Messages" not in message_response:
                 continue
 
+            logging.info("Request queue message received from web service !!!")
             message = message_response["Messages"][0]
             filename = message["Body"]
-            receipt_handle = message["ReceiptHandle"]
+            filename_only = filename.rsplit(".", 1)[0]
 
-            logging.info(f"Processing: {filename}")
+            logging.info(f"Fetching {filename} image from S3 bucket")
+            image = get_s3_object(filename)
 
-            # 🔁 1️⃣ Check DynamoDB first (duplicate prevention)
-            response = dynamo_table.get_item(Key={"filename": filename})
+            logging.info("Obtaining image prediction from model !!!")
+            face_name = get_model_prediction(image)
+            logging.info(f"Model Prediction : {face_name}")
 
-            if "Item" in response:
-                recognition = response["Item"]["recognition"]
-                logging.info("Duplicate request. Skipping inference.")
-
-            else:
-                # 🔥 2️⃣ Fetch image directly into memory (no disk write)
-                s3_object = s3.get_object(Bucket=bucket_name, Key=filename)
-                image_bytes = s3_object["Body"].read()
-
-                # 🔥 3️⃣ Run inference
-                recognition = fake_model_inference(image_bytes)
-
-                # 🔥 4️⃣ Conditional write (avoids race conditions)
-                try:
-                    dynamo_table.put_item(
-                        Item={
-                            "filename": filename,
-                            "recognition": recognition
-                        },
-                        ConditionExpression="attribute_not_exists(filename)"
-                    )
-                except ClientError as e:
-                    if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                        # Another instance inserted it
-                        response = dynamo_table.get_item(Key={"filename": filename})
-                        recognition = response["Item"]["recognition"]
-                    else:
-                        raise
-
-            # 🔥 5️⃣ Send response
-            sqs.send_message(
-                QueueUrl=resp_queue_url,
-                MessageBody=f"{filename}:{recognition}"
+            logging.info("Sending message to response queue from web service !!!")
+            sqs.send_message (
+                QueueUrl = response_queue_url,
+                MessageBody = f"{filename_only}:{face_name}"
             )
 
-            # 🔥 6️⃣ Delete request from queue
-            sqs.delete_message(
-                QueueUrl=req_queue_url,
-                ReceiptHandle=receipt_handle
+            sqs.delete_message (
+                QueueUrl = request_queue_url,
+                ReceiptHandle = message["ReceiptHandle"]
             )
 
-            logging.info(f"Completed: {filename}")
+            logging.info(f"Completed : {filename}")
 
         except Exception as e:
-            logging.error(f"Error: {str(e)}")
+            logging.error(f"Error : {str(e)}")
             time.sleep(2)
-
 
 if __name__ == "__main__":
     app_service()

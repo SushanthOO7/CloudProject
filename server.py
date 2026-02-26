@@ -4,9 +4,10 @@ from botocore.exceptions import ClientError
 from fastapi.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 import boto3
-
 import logging
 import csv
+import time
+import asyncio
 
 bucket_name = "1237312494-in-bucket"
 dynamo_db_domain_name = "1237312494-dynamoDB"
@@ -20,14 +21,19 @@ max_instances_limit = 15
 auth = "web-instance"
 security_group = "sg-045fcf946e29b8cb5"
 
+# For SQS Queue
+request_queue = "1237312494-req-queue"
+response_queue = "1237312494-resp-queue"
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.s3_client = boto3.client("s3")
     app.state.dynamo_client = boto3.client("dynamodb")
+    app.state.sqs_client = boto3.client("sqs")
     app.state.ec2_client = boto3.client("ec2", region_name = region)
-    logging.info("Application is up and running !!!")
+    logging.info("Web Service is up and running !!!")
     yield
-    logging.info("Shutting down application !!!")
+    logging.info("Shutting down Web Service !!!")
 
 app = FastAPI (
     lifespan = lifespan
@@ -42,40 +48,54 @@ async def image_input_output(inputFile: UploadFile):
         )
     if not inputFile.filename.lower().endswith((".jpg", ".jpeg", ".png")):
         raise HTTPException (
-            status_code=400,
-            detail="Invalid file type"
+            status_code = 400,
+            detail = "Invalid file type"
         )
-    filename_only = inputFile.filename.rsplit(".", 1)[0]
+
     s3_client = app.state.s3_client
+    logging.info("Uploading image to S3 bucket !!!")
     try:
-        await run_in_threadpool(
+        await run_in_threadpool (
             s3_client.upload_fileobj,
             inputFile.file,
             bucket_name,
             inputFile.filename
         )
+
     except ClientError as e:
         logging.error(e)
         raise HTTPException (
             status_code = 500,
             detail = f"Uploading the image to S3 bucket {bucket_name} failed !!!")
 
-    prediction_result = await get_image_name(filename_only)
+    logging.info("Sending message to request queue from web service !!!")
+    send_sqs_message(inputFile.filename)
 
-    return f"{filename_only}:{prediction_result}"
+    start_time = time.time()
+    while time.time() - start_time < 120:
+        result = receive_sqs_message()
+        if result:
+            logging.info("Response queue message received from app service !!!")
+            return result
+        await asyncio.sleep(2)
+
+    raise HTTPException (
+        status_code = 500,
+        detail = f"Timeout waiting for {inputFile.filename}"
+    )
 
 @app.get("/create_table/{table_name}")
 async def create_table(table_name):
     dynamo_client = app.state.dynamo_client
     response = dynamo_client.create_table(
-    AttributeDefinitions=[
+    AttributeDefinitions = [
         {
             'AttributeName': 'filename',
             'AttributeType': 'S'
         },
     ],
-    TableName= table_name,
-    KeySchema=[
+    TableName = table_name,
+    KeySchema = [
         {
             'AttributeName': 'filename',
             'KeyType': 'HASH'
@@ -108,7 +128,6 @@ async def populate_table(table_name):
             )
     return response
 
-
 async def get_image_name(filename):
     dynamo_client = app.state.dynamo_client
     try:
@@ -121,7 +140,6 @@ async def get_image_name(filename):
         return response["Item"]["name"]["S"]
     except Exception as e:
         raise HTTPException(500, f"Error : {str(e)}")
-
 
 @app.post("/create_instance")
 async def create_instances():
@@ -165,7 +183,6 @@ async def create_instances():
     except Exception as e:
         raise HTTPException(500, f"Error : {str(e)}")
 
-
 @app.get("/instance_status")
 async def get_instance_status():
     running = []
@@ -176,7 +193,7 @@ async def get_instance_status():
     ec2_client = app.state.ec2_client
 
     try:
-        response = ec2_client.describe_instances(
+        response = ec2_client.describe_instances (
             Filters =
             [
                 {
@@ -234,7 +251,9 @@ async def delete_instances():
             instance_ids.append(i["InstanceId"])
 
     if not instance_ids:
-        return {"status": "none_found"}
+        return {
+            "status" : "none_found"
+        }
 
     ec2_client.terminate_instances (
         InstanceIds = instance_ids
@@ -245,3 +264,45 @@ async def delete_instances():
         "count": len(instance_ids),
         "ids": instance_ids
     }
+
+def send_sqs_message(filename):
+    sqs_client = app.state.sqs_client
+    request_queue_url = sqs_client.get_queue_url(QueueName=request_queue)["QueueUrl"]
+
+    try:
+        sqs_client.send_message (
+            QueueUrl = request_queue_url,
+            MessageBody = filename
+        )
+        logging.info(f"Message sent successfully : {filename}")
+    except ClientError as e:
+        logging.error(e)
+        raise HTTPException (
+            status_code = 500,
+            detail = f"SQS send message operation failed !!! : \n {e}"
+        )
+
+def receive_sqs_message():
+    sqs_client = app.state.sqs_client
+    response_queue_url = sqs_client.get_queue_url(QueueName=response_queue)["QueueUrl"]
+    try:
+        message_response = sqs_client.receive_message (
+            QueueUrl = response_queue_url,
+            MaxNumberOfMessages = 1,
+            WaitTimeSeconds = 10
+        )
+
+        if "Messages" in message_response:
+            message = message_response["Messages"][0]
+            result = message["Body"]
+            logging.info(f"Message received successfully : {result}")
+
+            sqs_client.delete_message (
+                QueueUrl = response_queue_url,
+                ReceiptHandle = message["ReceiptHandle"]
+            )
+
+            return result
+
+    except ClientError as e:
+        print(f"Failed to receive message !!! : {e}")
