@@ -41,12 +41,14 @@ app = FastAPI (
 
 @app.post("/", response_class=PlainTextResponse)
 async def image_input_output(inputFile: UploadFile):
-    if not inputFile.filename:
+    filename = inputFile.filename
+    filename_only = filename.rsplit(".", 1)[0]
+    if not filename:
         raise HTTPException (
             status_code = 400,
             detail = "Input File is empty"
         )
-    if not inputFile.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+    if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
         raise HTTPException (
             status_code = 400,
             detail = "Invalid file type"
@@ -59,7 +61,7 @@ async def image_input_output(inputFile: UploadFile):
             s3_client.upload_fileobj,
             inputFile.file,
             bucket_name,
-            inputFile.filename
+            filename
         )
 
     except ClientError as e:
@@ -69,11 +71,11 @@ async def image_input_output(inputFile: UploadFile):
             detail = f"Uploading the image to S3 bucket {bucket_name} failed !!!")
 
     logging.info("Sending message to request queue from web service !!!")
-    send_sqs_message(inputFile.filename)
+    send_sqs_message(filename)
 
     start_time = time.time()
     while time.time() - start_time < 120:
-        result = receive_sqs_message()
+        result = await run_in_threadpool(receive_sqs_message, filename_only)
         if result:
             logging.info("Response queue message received from app service !!!")
             return result
@@ -131,9 +133,11 @@ async def populate_table(table_name):
 async def get_image_name(filename):
     dynamo_client = app.state.dynamo_client
     try:
-        response = dynamo_client.get_item(
-            TableName=dynamo_db_domain_name,
-            Key={"filename": {"S": filename}}
+        response = dynamo_client.get_item (
+            TableName = dynamo_db_domain_name,
+            Key = {
+                "filename": {"S": filename}
+            }
         )
         if "Item" not in response:
             raise HTTPException(404, "Image not in dataset")
@@ -282,27 +286,38 @@ def send_sqs_message(filename):
             detail = f"SQS send message operation failed !!! : \n {e}"
         )
 
-def receive_sqs_message():
+def receive_sqs_message(filename):
     sqs_client = app.state.sqs_client
     response_queue_url = sqs_client.get_queue_url(QueueName=response_queue)["QueueUrl"]
     try:
         message_response = sqs_client.receive_message (
             QueueUrl = response_queue_url,
             MaxNumberOfMessages = 1,
-            WaitTimeSeconds = 10
+            WaitTimeSeconds = 5
         )
 
-        if "Messages" in message_response:
-            message = message_response["Messages"][0]
-            result = message["Body"]
-            logging.info(f"Message received successfully : {result}")
+        if "Messages" not in message_response:
+            return None
 
-            sqs_client.delete_message (
+        message = message_response["Messages"][0]
+        body = message["Body"]
+
+        message_filename = body.split(":")[0]
+
+        if message_filename == filename:
+            sqs_client.delete_message(
                 QueueUrl = response_queue_url,
-                ReceiptHandle = message["ReceiptHandle"]
+                ReceiptHandle = message["ReceiptHandle"],
             )
+            return body
 
-            return result
+        else:
+            sqs_client.change_message_visibility (
+                QueueUrl = response_queue_url,
+                ReceiptHandle = message["ReceiptHandle"],
+                VisibilityTimeout = 0,
+            )
+            return None
 
     except ClientError as e:
-        print(f"Failed to receive message !!! : {e}")
+        logging.error(f"Failed to receive message !!! : {e}")

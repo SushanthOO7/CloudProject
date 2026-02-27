@@ -3,6 +3,8 @@ import time
 import logging
 from model.face_recognition import face_match
 
+logging.basicConfig(level=logging.INFO)
+
 bucket_name = "1237312494-in-bucket"
 request_queue = "1237312494-req-queue"
 response_queue = "1237312494-resp-queue"
@@ -21,7 +23,7 @@ def get_model_prediction(image):
         result = face_match(image)
         return result
     except Exception as e:
-        print(f"Error : {e}")
+        logging.error(f"Error : {e}")
 
 def get_dynamo_db_items(filename):
     response = dynamo_table.get_item (
@@ -30,6 +32,35 @@ def get_dynamo_db_items(filename):
         }
     )
     return response
+
+def check_dynamo_db(filename_only):
+    try:
+        response = dynamo_table.get_item (
+            Key = {
+                "filename": filename_only
+            }
+        )
+        if "Item" in response:
+            logging.info(f"Filename exists for {filename_only}")
+            return response["Item"]["name"]
+        return None
+
+    except Exception as e:
+        logging.warning(f"DynamoDB check failed !!! : \n {e}")
+        return None
+
+def insert_to_dynamo_db(filename_only, face_name):
+    try:
+        dynamo_table.put_item (
+            Item = {
+                "filename": filename_only,
+                "name": face_name
+            }
+        )
+        logging.info(f"Successfully stored in DynamoDB : {filename_only} - {face_name}")
+
+    except Exception as e:
+        logging.error(f"Failed to store in DynamoDB : \n {e}")
 
 def get_s3_object(filename):
     value = s3.get_object (
@@ -58,25 +89,34 @@ def app_service():
             filename = message["Body"]
             filename_only = filename.rsplit(".", 1)[0]
 
-            logging.info(f"Fetching {filename} image from S3 bucket")
-            image = get_s3_object(filename)
+            face_name = check_dynamo_db(filename_only)
 
-            logging.info("Obtaining image prediction from model !!!")
-            face_name = get_model_prediction(image)
-            logging.info(f"Model Prediction : {face_name}")
+            if face_name is None:
+                logging.info(f"Fetching {filename} image from S3 bucket")
+                image = get_s3_object(filename)
+
+                logging.info("Obtaining image prediction from model !!!")
+                face_name = get_model_prediction(image)
+                logging.info(f"Model Prediction : {face_name}")
+
+                insert_to_dynamo_db(filename_only, face_name)
+
+            else:
+                logging.info(f"Using DynamoDB data : {filename_only} - {face_name}")
 
             logging.info("Sending message to response queue from web service !!!")
+
             sqs.send_message (
                 QueueUrl = response_queue_url,
                 MessageBody = f"{filename_only}:{face_name}"
             )
+            logging.info(f"Sent to response queue : {filename_only}:{face_name}")
 
             sqs.delete_message (
                 QueueUrl = request_queue_url,
                 ReceiptHandle = message["ReceiptHandle"]
             )
-
-            logging.info(f"Completed : {filename}")
+            logging.info(f"Deleted {filename} from request queue")
 
         except Exception as e:
             logging.error(f"Error : {str(e)}")

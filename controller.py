@@ -2,145 +2,89 @@ import boto3
 import time
 import logging
 
+logging.basicConfig(level=logging.INFO)
+
 request_queue = "1237312494-req-queue"
+max_instances_limit = 15
 
 ec2 = boto3.client("ec2")
 sqs = boto3.client("sqs")
 
 request_queue_url = sqs.get_queue_url(QueueName=request_queue)["QueueUrl"]
 
-my_ami_id = "ami-06d2c2b98f0871537"
-instance_type = "t3.small"
-
-max_instances_limit = 15
-
-def check_running_instances():
-    response = ec2.describe_instances (
-        Filters = [
-            { "Name" : "tag:Name",
-              "Values" : ["app-tier-instance-*"]
-            },
-            { "Name" : "instance-state-name",
-              "Values" : ["running"]
-            }
-        ]
-    )
-    count = 0
-    for i in response["Reservations"]:
-        count += len(i["Instances"])
-    return count
-
-def get_all_instance_ids():
+def get_instance_details():
     response = ec2.describe_instances (
         Filters = [
             {
                 "Name" : "tag:Name",
-                "Values": ["*"]
-            }
+                "Values": ["app-tier-instance-*"]},
+            {
+                "Name": "instance-state-name",
+                "Values": ["running", "stopped", "pending", "stopping"]
+            },
         ]
     )
-
-    instance_ids = [
-        inst["InstanceId"]
-        for res in response["Reservations"]
-        for inst in res["Instances"]
-    ]
-
-    logging.info(f"Instances Id : {instance_ids}")
-    return instance_ids
+    instances = {}
+    for r in response["Reservations"]:
+        for i in r["Instances"]:
+            instances[i["InstanceId"]] = i["State"]["Name"]
+    return instances
 
 def get_queue_details():
-    request = sqs.get_queue_attributes (
+    queue_attributes = sqs.get_queue_attributes (
         QueueUrl = request_queue_url,
         AttributeNames = [
             "ApproximateNumberOfMessages",
-            "ApproximateNumberOfMessagesNotVisible"
-        ]
+            "ApproximateNumberOfMessagesNotVisible",
+        ],
     )["Attributes"]
 
-    pending_requests = int(request["ApproximateNumberOfMessages"])
-    in_progress_requests = int(request["ApproximateNumberOfMessagesNotVisible"])
+    pending = int(queue_attributes["ApproximateNumberOfMessages"])
+    in_progress = int(queue_attributes["ApproximateNumberOfMessagesNotVisible"])
 
-    total_requests = pending_requests + in_progress_requests
-    logging.info(f"Total load : {total_requests}")
-    return total_requests
+    total = pending + in_progress
 
-
-def start_instances(instance_ids, required):
-    if required == 0:
-        return
-
-    running = check_running_instances()
-    needed = required - running
-
-    if needed <= 0:
-        logging.info("All the app tier instances are running !!!")
-        return
-
-    stopped = get_stopped_instances(instance_ids)
-    start = stopped[:needed]
-
-    if start:
-        logging.info(f"Starting {len(start)} instances !!!")
-        ec2.start_instances(InstanceIds = start)
-    else:
-        logging.info("Instances not available !!!")
-
-def get_stopped_instances(instance_ids):
-    resp = ec2.describe_instances(InstanceIds = instance_ids)
-    stopped_instance_ids = [
-        i["InstanceId"]
-        for res in resp["Reservations"]
-        for i in res["Instances"]
-        if i["State"]["Name"] == "stopped"
-    ]
-    return stopped_instance_ids
-
-def stop_instances(instance_ids, required):
-    running = check_running_instances()
-
-    if running <= required:
-        return
-
-    extra = running - required
-
-    all_resp = ec2.describe_instances (
-        Filters = [
-            {
-                "Name": "tag:Name",
-                "Values": [f"app-tier-instance-*"]
-            }
-        ]
-    )
-
-    running_ids = [
-        i["InstanceId"]
-        for res in all_resp["Reservations"]
-        for i in res["Instances"]
-        if i["State"]["Name"] == "running"
-    ][:extra]
-
-    if running_ids:
-        logging.info(f"Stopping instances : {running_ids}")
-        ec2.stop_instances(InstanceIds = running_ids)
+    logging.info(f"Queue Load — Pending: {pending}, In-Flight: {in_progress}, Total: {total}")
+    return total
 
 def autoscale():
     logging.info("Autoscale Service started !!!")
-    instance_ids = get_all_instance_ids()
-
     while True:
-        running = check_running_instances()
-        workload = get_queue_details()
+        try:
+            instances = get_instance_details()
+            load = get_queue_details()
 
-        target_instances = min(workload, 15)
-        target_instances = max(0, target_instances)
+            running_ids = [instance_id for instance_id, state in instances.items() if state == "running"]
+            stopped_ids = [instance_id for instance_id, state in instances.items() if state == "stopped"]
+            pending_ids = [instance_id for instance_id, state in instances.items() if state == "pending"]
 
-        logging.info(f"Running: {running}, Workload: {workload}, Target: {target_instances}")
+            running = len(running_ids) + len(pending_ids)
 
-        if running < target_instances:
-            start_instances(instance_ids, target_instances)
-        elif running > target_instances:
-            stop_instances(instance_ids, target_instances)
+            required = min(load, max_instances_limit)
+
+            logging.info (
+                f"Running: {len(running_ids)}, Pending: {len(pending_ids)}, "
+                f"Stopped: {len(stopped_ids)}, Needed: {required}"
+            )
+
+            if running < required:
+                needed = required - running
+                start = stopped_ids[:needed]
+                if start:
+                    logging.info(f"Starting {len(start)} instances : {start}")
+                    ec2.start_instances(InstanceIds = start)
+                else:
+                    logging.warning("There are no stopped instances to start.")
+
+            elif len(running_ids) > required:
+                excess = len(running_ids) - required
+                stop = running_ids[:excess]
+                if stop:
+                    logging.info(f"Stopping {len(stop)} instances : {stop}")
+                    ec2.stop_instances(InstanceIds = stop)
+
+        except Exception as e:
+            logging.error(f"Error : {e}")
 
         time.sleep(2)
 

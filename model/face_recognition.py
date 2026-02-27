@@ -1,8 +1,6 @@
 __copyright__   = "Copyright 2026, VISA Lab"
 __license__     = "MIT"
 
-import os
-import sys
 import torch
 import io
 from PIL import Image
@@ -37,7 +35,7 @@ def face_match(img_path): # img_path= location of photo, data_path= location of 
         dist_list.append(dist)
 
     idx_min = dist_list.index(min(dist_list))
-    return (name_list[idx_min])
+    return name_list[idx_min]
 
 if __name__ == "__main__":
     import sys

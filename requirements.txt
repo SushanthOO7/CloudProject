@@ -1,3 +1,7 @@
 fastapi
 boto3
 uvicorn
+torch
+pillow
+python-multipart
+facenet_pytorch
