@@ -1,20 +1,22 @@
 from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.responses import PlainTextResponse
 from botocore.exceptions import ClientError
+from botocore.config import Config
 from fastapi.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 import boto3
 import logging
 import csv
-import time
 import asyncio
+
+logging.basicConfig(level=logging.INFO)
 
 bucket_name = "1237312494-in-bucket"
 dynamo_db_domain_name = "1237312494-dynamoDB"
 dataset = "face_images_dataset.csv"
 
 # For EC2 instances
-my_ami_id = "ami-06d2c2b98f0871537"
+my_ami_id = "ami-0179c5ad94ea17cf7"
 instance_type = "t3.small"
 region = "us-west-2"
 max_instances_limit = 15
@@ -25,24 +27,79 @@ security_group = "sg-045fcf946e29b8cb5"
 request_queue = "1237312494-req-queue"
 response_queue = "1237312494-resp-queue"
 
+# For response state
+response_results: dict = {}
+response_events:  dict = {}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.s3_client = boto3.client("s3")
+    s3_config = Config(max_pool_connections=50)
+    sqs_config = Config(max_pool_connections=50)
+
+    app.state.s3_client = boto3.client("s3", config=s3_config)
     app.state.dynamo_client = boto3.client("dynamodb")
-    app.state.sqs_client = boto3.client("sqs")
     app.state.ec2_client = boto3.client("ec2", region_name = region)
+    sqs = boto3.client("sqs", config=sqs_config)
+    app.state.sqs_client= sqs
+    app.state.request_queue_url = sqs.get_queue_url(QueueName = request_queue)["QueueUrl"]
+    app.state.response_queue_url = sqs.get_queue_url(QueueName = response_queue)["QueueUrl"]
+
+    task = asyncio.create_task(response_consumer(app))
     logging.info("Web Service is up and running !!!")
+
     yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     logging.info("Shutting down Web Service !!!")
 
 app = FastAPI (
     lifespan = lifespan
 )
 
+async def response_consumer(app: FastAPI) -> None:
+    sqs_client = app.state.sqs_client
+    response_url = app.state.response_queue_url
+
+    while True:
+        try:
+            response = await run_in_threadpool(
+                sqs_client.receive_message,
+                QueueUrl = response_url,
+                MaxNumberOfMessages = 10,
+                WaitTimeSeconds = 2,
+            )
+            for message in response.get("Messages", []):
+                body = message["Body"]
+                receipt = message["ReceiptHandle"]
+                key = body.split(":")[0]
+
+                response_results[key] = body
+                await run_in_threadpool(
+                    sqs_client.delete_message,
+                    QueueUrl = response_url,
+                    ReceiptHandle = receipt,
+                )
+                logging.info(f"[consumer] Deleted response for {key}")
+
+                event = response_events.get(key)
+                if event:
+                    event.set()
+
+        except asyncio.CancelledError:
+            logging.info("[consumer] Shutting down")
+            break
+        except Exception as e:
+            logging.error(f"[consumer] Error: {e}")
+            await asyncio.sleep(0.5)
+
 @app.post("/", response_class=PlainTextResponse)
 async def image_input_output(inputFile: UploadFile):
     filename = inputFile.filename
     filename_only = filename.rsplit(".", 1)[0]
+
     if not filename:
         raise HTTPException (
             status_code = 400,
@@ -54,37 +111,60 @@ async def image_input_output(inputFile: UploadFile):
             detail = "Invalid file type"
         )
 
+    file_contents = await inputFile.read()
+
+    event = asyncio.Event()
+    response_events[filename_only] = event
+    response_results.pop(filename_only, None)
+
     s3_client = app.state.s3_client
     logging.info("Uploading image to S3 bucket !!!")
-    try:
-        await run_in_threadpool (
-            s3_client.upload_fileobj,
-            inputFile.file,
-            bucket_name,
-            filename
-        )
+    for attempt in range(3):
+        try:
+            await run_in_threadpool (
+                s3_client.put_object,
+                Bucket = bucket_name,
+                Key = filename,
+                Body = file_contents,
+            )
+            break
 
-    except ClientError as e:
-        logging.error(e)
-        raise HTTPException (
-            status_code = 500,
-            detail = f"Uploading the image to S3 bucket {bucket_name} failed !!!")
+        except ClientError as e:
+            response_events.pop(filename_only, None)
+            logging.error(e)
+            raise HTTPException (
+                status_code = 500,
+                detail = f"Uploading the image to S3 bucket {bucket_name} failed !!!")
+
+        except Exception as e:
+            if attempt == 2:
+                response_events.pop(filename_only, None)
+                raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
+            logging.warning(f"Upload failed, retrying for {attempt + 1} time !")
+            await asyncio.sleep(0.5)
 
     logging.info("Sending message to request queue from web service !!!")
-    send_sqs_message(filename)
+    await send_sqs_message(filename, filename_only)
 
-    start_time = time.time()
-    while time.time() - start_time < 120:
-        result = await run_in_threadpool(receive_sqs_message, filename_only)
+    # Waiting here for the consumer to deliver result
+    try:
+        await asyncio.wait_for(event.wait(), timeout = 120)
+        result = response_results.pop(filename_only, None)
         if result:
-            logging.info("Response queue message received from app service !!!")
+            logging.info(f"Response returned result : {result}")
             return result
-        await asyncio.sleep(2)
-
-    raise HTTPException (
-        status_code = 500,
-        detail = f"Timeout waiting for {inputFile.filename}"
-    )
+        raise HTTPException(
+            status_code = 500,
+            detail = f"Result missing for {filename}"
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code = 500,
+            detail = f"Timeout waiting for {filename}"
+        )
+    finally:
+        response_events.pop(filename_only, None)
+        response_results.pop(filename_only, None)
 
 @app.get("/create_table/{table_name}")
 async def create_table(table_name):
@@ -269,55 +349,52 @@ async def delete_instances():
         "ids": instance_ids
     }
 
-def send_sqs_message(filename):
+async def send_sqs_message(filename, filename_only):
     sqs_client = app.state.sqs_client
-    request_queue_url = sqs_client.get_queue_url(QueueName=request_queue)["QueueUrl"]
-
-    try:
-        sqs_client.send_message (
-            QueueUrl = request_queue_url,
-            MessageBody = filename
-        )
-        logging.info(f"Message sent successfully : {filename}")
-    except ClientError as e:
-        logging.error(e)
-        raise HTTPException (
-            status_code = 500,
-            detail = f"SQS send message operation failed !!! : \n {e}"
-        )
-
-def receive_sqs_message(filename):
-    sqs_client = app.state.sqs_client
-    response_queue_url = sqs_client.get_queue_url(QueueName=response_queue)["QueueUrl"]
-    try:
-        message_response = sqs_client.receive_message (
-            QueueUrl = response_queue_url,
-            MaxNumberOfMessages = 1,
-            WaitTimeSeconds = 5
-        )
-
-        if "Messages" not in message_response:
-            return None
-
-        message = message_response["Messages"][0]
-        body = message["Body"]
-
-        message_filename = body.split(":")[0]
-
-        if message_filename == filename:
-            sqs_client.delete_message(
-                QueueUrl = response_queue_url,
-                ReceiptHandle = message["ReceiptHandle"],
+    for attempt in range(3):
+        try:
+            sqs_client.send_message (
+                QueueUrl = app.state.request_queue_url,
+                MessageBody = filename
             )
-            return body
+            logging.info(f"Message sent successfully : {filename}")
+            break
 
-        else:
-            sqs_client.change_message_visibility (
-                QueueUrl = response_queue_url,
-                ReceiptHandle = message["ReceiptHandle"],
-                VisibilityTimeout = 0,
+        except ClientError as e:
+            response_events.pop(filename_only, None)
+            logging.error(e)
+            raise HTTPException (
+                status_code = 500,
+                detail = f"SQS send message operation failed !!! : \n {e}"
             )
-            return None
 
-    except ClientError as e:
-        logging.error(f"Failed to receive message !!! : {e}")
+        except Exception as e:
+            if attempt == 2:
+                response_events.pop(filename_only, None)
+                raise HTTPException(status_code = 500, detail=f"SQS send failed: {e}")
+            logging.warning(f"SQS send message failed, retrying for {attempt + 1} time !")
+            await asyncio.sleep(0.5)
+
+@app.delete("/clean_s3")
+async def clean_s3_bucket():
+    s3_client = app.state.s3_client
+    try:
+        response = s3_client.list_objects_v2(Bucket = bucket_name)
+        objects  = response.get("Contents", [])
+
+        if not objects:
+            return {"S3 Bucket ": "already_empty", "Deleted Objects ": 0}
+
+        payload = {
+            "Objects": [{"Key": obj["Key"]}
+                               for obj in objects]
+        }
+        s3_client.delete_objects(
+            Bucket = bucket_name,
+            Delete = payload
+        )
+
+        return {"status": "All Objects Cleaned", "deleted": len(objects)}
+
+    except Exception as e:
+        raise HTTPException(status_code = 500, detail = f"S3 cleanup failed: {e}")

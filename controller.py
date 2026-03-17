@@ -6,6 +6,7 @@ logging.basicConfig(level=logging.INFO)
 
 request_queue = "1237312494-req-queue"
 max_instances_limit = 15
+shutdown_time = 1
 
 ec2 = boto3.client("ec2")
 sqs = boto3.client("sqs")
@@ -44,47 +45,79 @@ def get_queue_details():
 
     total = pending + in_progress
 
-    logging.info(f"Queue Load — Pending: {pending}, In-Flight: {in_progress}, Total: {total}")
+    logging.info(f"Queue Load — Pending: {pending}, In Progress: {in_progress}, Total: {total}")
     return total
 
 def autoscale():
     logging.info("Autoscale Service started !!!")
+    all_instances_active = False
+    count_time = 0
     while True:
         try:
             instances = get_instance_details()
             load = get_queue_details()
 
-            running_ids = [instance_id for instance_id, state in instances.items() if state == "running"]
-            stopped_ids = [instance_id for instance_id, state in instances.items() if state == "stopped"]
-            pending_ids = [instance_id for instance_id, state in instances.items() if state == "pending"]
+            running_ids = [instance_id
+                           for instance_id, state in instances.items()
+                           if state == "running"]
+            stopped_ids = [instance_id
+                           for instance_id, state in instances.items()
+                           if state == "stopped"]
+            pending_ids = [instance_id
+                           for instance_id, state in instances.items()
+                           if state == "pending"]
+            stopping_ids = [instance_id
+                            for instance_id, state in instances.items()
+                            if state == "stopping"]
 
-            running = len(running_ids) + len(pending_ids)
-
-            required = min(load, max_instances_limit)
+            running = len(running_ids)
+            pending = len(pending_ids)
+            stopped = len(stopped_ids)
+            stopping = len(stopping_ids)
 
             logging.info (
-                f"Running: {len(running_ids)}, Pending: {len(pending_ids)}, "
-                f"Stopped: {len(stopped_ids)}, Needed: {required}"
+                f"Running: {running}, "
+                f"Pending: {pending}, "
+                f"Stopped: {stopped}, "
+                f"Stopping: {stopping} "
             )
 
-            if running < required:
-                needed = required - running
-                start = stopped_ids[:needed]
-                if start:
-                    logging.info(f"Starting {len(start)} instances : {start}")
-                    ec2.start_instances(InstanceIds = start)
-                else:
-                    logging.warning("There are no stopped instances to start.")
+            # Setting the peak no of instances reached
+            if running >= max_instances_limit:
+                all_instances_active = True
 
-            elif len(running_ids) > required:
-                excess = len(running_ids) - required
-                stop = running_ids[:excess]
-                if stop:
-                    logging.info(f"Stopping {len(stop)} instances : {stop}")
-                    ec2.stop_instances(InstanceIds = stop)
+            # If all the instances are running and there is no load then updating to stop all the insatnces as there is no traffic to our application
+            if all_instances_active and running == 0 and pending == 0 and stopping == 0 and load == 0:
+                logging.info("Updating to set all the instances to stop state")
+                all_instances_active = False
+                count_time = 0
 
+            # When we have requests to our applications, starting the instances as needed
+            if load > 0:
+                count_time = 0
+                active = running + pending
+                if active < max_instances_limit and stopping == 0:
+                    needed = max_instances_limit - active
+                    start = stopped_ids[:needed]
+                    if start:
+                        logging.info(f"Starting {len(start)} instances")
+                        ec2.start_instances(InstanceIds = start)
+                    elif active == 0:
+                        logging.warning("Instances might still be in stopping state, there are no stopped instances !!!")
+
+            # When we have updated and want to stop all the instances we stop it in 10 countdowns slowly
+            elif all_instances_active and pending == 0 and stopping == 0:
+                count_time += 1
+                logging.info(f"Shutting down all instances, Countdown : {count_time} of {shutdown_time}")
+
+                if count_time >= shutdown_time:
+                    if running:
+                        logging.info(f"Stopping {running} instances")
+                        ec2.stop_instances(InstanceIds = running_ids)
+                    all_instances_active = False
+                    count_time = 0
         except Exception as e:
-            logging.error(f"Error : {e}")
+            logging.error(f"Error: {e}")
 
         time.sleep(2)
 

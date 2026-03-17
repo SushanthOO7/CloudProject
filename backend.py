@@ -77,8 +77,8 @@ def app_service():
             message_response = sqs.receive_message (
                 QueueUrl = request_queue_url,
                 MaxNumberOfMessages = 1,
-                WaitTimeSeconds = 20,
-                VisibilityTimeout = 60
+                WaitTimeSeconds = 5,
+                VisibilityTimeout = 90
             )
 
             if "Messages" not in message_response:
@@ -89,17 +89,29 @@ def app_service():
             filename = message["Body"]
             filename_only = filename.rsplit(".", 1)[0]
 
+            start = time.time()
+
+            # Checking the Dynamo DB first
             face_name = check_dynamo_db(filename_only)
 
             if face_name is None:
+                # SInce we didnt find the image in dynamo DB, getting it from S3
                 logging.info(f"Fetching {filename} image from S3 bucket")
                 image = get_s3_object(filename)
 
+                # Getting prediction from the model
                 logging.info("Obtaining image prediction from model !!!")
                 face_name = get_model_prediction(image)
                 logging.info(f"Model Prediction : {face_name}")
 
+                # Storing in DynamoDB for next iterations
                 insert_to_dynamo_db(filename_only, face_name)
+
+                elapsed = time.time() - start
+                remaining = 4.0 - elapsed
+                if remaining > 0:
+                    logging.info(f"Waiting for {remaining:.2f}s")
+                    time.sleep(remaining)
 
             else:
                 logging.info(f"Using DynamoDB data : {filename_only} - {face_name}")
